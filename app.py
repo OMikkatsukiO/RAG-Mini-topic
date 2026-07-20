@@ -8,7 +8,6 @@ import unicodedata
 from typing import List, Optional
 
 import chromadb
-from chromadb.utils import embedding_functions
 from pypdf import PdfReader
 from docx import Document as DocxDocument
 from google import genai
@@ -25,7 +24,8 @@ QA_LOG_PATH = f"{DATA_DIR}/qa_history.jsonl"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 GEMINI_MODEL = "gemini-2.5-flash"
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+GEMINI_EMBEDDING_MODEL = "gemini-embedding-001"
+EMBEDDING_DIMENSION = 768  # gemini-embedding-001 預設 3072 維,縮小到 768 省儲存空間,RAG 用途足夠
 
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 80
@@ -203,14 +203,33 @@ CHUNK_STRATEGIES = {
 DEFAULT_STRATEGY = "固定長度"
 
 
+def embed_texts(api_key: str, texts: List[str], task_type: str = "RETRIEVAL_DOCUMENT") -> List[List[float]]:
+    """呼叫 Gemini 的 embedding API 把文字轉成向量。刻意不在本地載入任何 embedding 模型
+    (例如 sentence-transformers)——那會連帶拉入 PyTorch,在 512MB 記憶體的免費方案上會被 OOM 砍掉。
+    task_type 分開 RETRIEVAL_DOCUMENT(存文件用)跟 RETRIEVAL_QUERY(查詢用),檢索品質比兩邊都用同一種更好。
+    """
+    if not texts:
+        return []
+    if not api_key:
+        raise RuntimeError("請先在上方輸入你的 Gemini API Key。")
+    client = genai.Client(api_key=api_key)
+    response = client.models.embed_content(
+        model=GEMINI_EMBEDDING_MODEL,
+        contents=texts,
+        config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIMENSION, task_type=task_type),
+    )
+    return [e.values for e in response.embeddings]
+
+
 class VectorStore:
     def __init__(self):
         self.client = chromadb.PersistentClient(path=CHROMA_DIR)
-        self.embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL_NAME)
-        self.documents = self.client.get_or_create_collection("documents", embedding_function=self.embed_fn)
-        self.qa_history = self.client.get_or_create_collection("qa_history", embedding_function=self.embed_fn)
+        # 故意不指定 embedding_function——向量一律由呼叫端先用 embed_texts()(呼叫 Gemini API)
+        # 算好再手動傳進來,chromadb 這裡只負責儲存跟比對,不會在本地載入任何模型。
+        self.documents = self.client.get_or_create_collection("documents")
+        self.qa_history = self.client.get_or_create_collection("qa_history")
 
-    def add_text(self, text: str, source_name: str, strategy: str = DEFAULT_STRATEGY) -> int:
+    def add_text(self, api_key: str, text: str, source_name: str, strategy: str = DEFAULT_STRATEGY) -> int:
         """把『已經讀取好、清理過』的文字,依指定策略切塊後存進向量庫。
         跟讀檔案的步驟分開,讓上傳文件、選切分策略可以是兩個獨立動作。"""
         split_fn = CHUNK_STRATEGIES.get(strategy, CHUNK_STRATEGIES[DEFAULT_STRATEGY])
@@ -223,9 +242,10 @@ class VectorStore:
         if existing["ids"]:
             self.documents.delete(ids=existing["ids"])
 
+        embeddings = embed_texts(api_key, chunks, task_type="RETRIEVAL_DOCUMENT")
         ids = [str(uuid.uuid4()) for _ in chunks]
         metadatas = [{"source": source_name, "chunk_index": i, "strategy": strategy} for i in range(len(chunks))]
-        self.documents.add(documents=chunks, ids=ids, metadatas=metadatas)
+        self.documents.add(documents=chunks, embeddings=embeddings, ids=ids, metadatas=metadatas)
         return len(chunks)
 
     def list_sources(self) -> List[str]:
@@ -233,10 +253,11 @@ class VectorStore:
         sources = {m.get("source") for m in result.get("metadatas", []) if m}
         return sorted(sources)
 
-    def search_documents(self, query: str, top_k: int = TOP_K_DOCS) -> List[str]:
+    def search_documents(self, api_key: str, query: str, top_k: int = TOP_K_DOCS) -> List[str]:
         if self.documents.count() == 0:
             return []
-        result = self.documents.query(query_texts=[query], n_results=min(top_k, self.documents.count()))
+        query_embedding = embed_texts(api_key, [query], task_type="RETRIEVAL_QUERY")[0]
+        result = self.documents.query(query_embeddings=[query_embedding], n_results=min(top_k, self.documents.count()))
         return result.get("documents", [[]])[0]
 
 
@@ -277,23 +298,26 @@ class QAMemory:
     def __init__(self, vector_store):
         self.vector_store = vector_store
 
-    def save(self, question, answer, source="web"):
+    def save(self, api_key: str, question, answer, source="web"):
         question = clean_text(question)
         answer = clean_text(answer)
         qa_id = str(uuid.uuid4())
         record = {"id": qa_id, "question": question, "answer": answer, "source": source, "timestamp": time.time()}
+        doc_text = f"問題:{question}\n答案:{answer}"
+        embedding = embed_texts(api_key, [doc_text], task_type="RETRIEVAL_DOCUMENT")[0]
         self.vector_store.qa_history.add(
-            documents=[f"問題:{question}\n答案:{answer}"], ids=[qa_id],
+            documents=[doc_text], embeddings=[embedding], ids=[qa_id],
             metadatas=[{"source": source, "timestamp": record["timestamp"]}],
         )
         with open(QA_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    def search_similar(self, question, top_k=TOP_K_QA_HISTORY):
+    def search_similar(self, api_key: str, question, top_k=TOP_K_QA_HISTORY):
         collection = self.vector_store.qa_history
         if collection.count() == 0:
             return []
-        result = collection.query(query_texts=[question], n_results=min(top_k, collection.count()))
+        query_embedding = embed_texts(api_key, [question], task_type="RETRIEVAL_QUERY")[0]
+        result = collection.query(query_embeddings=[query_embedding], n_results=min(top_k, collection.count()))
         return result.get("documents", [[]])[0]
 
     def load_all(self) -> List[dict]:
@@ -383,15 +407,21 @@ def stage_documents(files, staged_docs):
     return staged_docs, status, gr.update(visible=True)
 
 
-def process_staged_documents(staged_docs, strategy):
-    """第二步(套用策略):使用者選好切分策略後,才真正把暫存的文字切塊、存進向量庫。"""
+def process_staged_documents(staged_docs, strategy, api_key):
+    """第二步(套用策略):使用者選好切分策略後,才真正把暫存的文字切塊、存進向量庫。
+    這一步需要呼叫 Gemini 的 embedding API,所以也需要 api_key。"""
     if not staged_docs:
         return "還沒有上傳文件,請先在上面上傳。"
-    total_chunks, names = 0, []
-    for name, text in staged_docs.items():
-        total_chunks += vector_store.add_text(text, source_name=name, strategy=strategy)
-        names.append(name)
-    return f"已用「{strategy}」切分 {len(names)} 個檔案({', '.join(names)}),共存入 {total_chunks} 個片段。"
+    if not api_key:
+        return "請先在上方輸入你的 Gemini API Key,切塊需要呼叫 embedding API。"
+    try:
+        total_chunks, names = 0, []
+        for name, text in staged_docs.items():
+            total_chunks += vector_store.add_text(api_key, text, source_name=name, strategy=strategy)
+            names.append(name)
+        return f"已用「{strategy}」切分 {len(names)} 個檔案({', '.join(names)}),共存入 {total_chunks} 個片段。"
+    except Exception as e:
+        return f"處理失敗:{e}"
 
 
 def list_sources_fn():
@@ -403,10 +433,10 @@ def chat(message, chat_history, session_history, api_key):
     if not message.strip():
         return "", chat_history, session_history
     try:
-        doc_chunks = vector_store.search_documents(message)
-        qa_chunks = qa_memory.search_similar(message)
+        doc_chunks = vector_store.search_documents(api_key, message)
+        qa_chunks = qa_memory.search_similar(api_key, message)
         answer, session_history = generate_answer(api_key, message, doc_chunks, session_history, qa_chunks)
-        qa_memory.save(message, answer, source="web")
+        qa_memory.save(api_key, message, answer, source="web")
     except Exception as e:
         answer = f"發生錯誤,請稍後再試:{e}"
     chat_history = chat_history + [
@@ -478,7 +508,9 @@ with gr.Blocks(title="RAG 文件問答小專題(Gemini 版)") as demo:
         inputs=[file_input, staged_docs_state],
         outputs=[staged_docs_state, upload_status, strategy_group],
     )
-    process_btn.click(process_staged_documents, inputs=[staged_docs_state, strategy_choice], outputs=process_status).then(
+    process_btn.click(
+        process_staged_documents, inputs=[staged_docs_state, strategy_choice, api_key_input], outputs=process_status
+    ).then(
         list_sources_fn, outputs=source_list
     )
     list_btn.click(list_sources_fn, outputs=source_list)

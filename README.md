@@ -20,6 +20,7 @@
   - 滑動視窗:固定長度 + 區塊間保留重疊。
   - 混合策略:遞歸切分的基礎上再補重疊。
 - **模型**:Gemini API(`gemini-2.5-flash`),不自架模型,免費方案就能跑,不用等模型下載。
+- **Embedding**:也是呼叫 Gemini API(`gemini-embedding-001`),不在本地載入任何 embedding 模型。這點是刻意的:本地跑 embedding(例如 sentence-transformers)會連帶載入 PyTorch,記憶體需求動輒 500MB 以上,免費方案(通常 512MB)撐不住,啟動時就會被系統判定 OOM 砍掉。
 - **問答記憶**:每輪問答存進向量庫(未來類似問題可以被檢索到)+ 一份 `data/qa_history.jsonl`(完整紀錄)。這是檢索式記憶,不會拿這些資料重新訓練模型。
 - **匯出推播**:把累積的完整問答紀錄打包成 JSON 或 TXT,透過 Telegram Bot API(`send_document`)或 Discord Webhook 推送出去。
 
